@@ -1,6 +1,10 @@
 package com.tua.baul
 
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
+import android.graphics.Path
+import android.graphics.Shader
+import android.graphics.Typeface
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -10,6 +14,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,10 +39,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.automirrored.rounded.Undo
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Flip
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.RotateRight
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -45,6 +54,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -58,6 +68,8 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -109,11 +121,23 @@ data class AjustesFoto(
     val neutro get() = this == AjustesFoto()
 }
 
+/** Trazo a mano o de mosaico. Puntos en 0..1; ancho relativo al lado corto. */
+data class Trazo(val puntos: List<Offset>, val color: Int, val ancho: Float)
+
+/** Texto sobre la foto. (x, y) es el centro, en 0..1; tam relativo al lado corto. */
+data class TextoCapa(val texto: String, val x: Float, val y: Float, val tam: Float, val color: Int)
+
 data class Edicion(
     val geo: Geo = Geo(),
     val aj: AjustesFoto = AjustesFoto(),
     val estilo: Estilo? = null,
-    val estiloAj: Ajustes = Ajustes()
+    val estiloAj: Ajustes = Ajustes(),
+    val textos: List<TextoCapa> = emptyList(),
+    val trazos: List<Trazo> = emptyList(),
+    val mosaicos: List<Trazo> = emptyList(),
+    val sello: Boolean = false,
+    val firma: String = "",
+    val fechaSello: Long = 0L
 )
 
 object Edit {
@@ -219,13 +243,95 @@ object Edit {
         out
     }
 
-    /** Toda la edición: geometría → recorte → ajustes → filtro. */
+    private fun ruta(t: Trazo, w: Float, h: Float): Path {
+        val p = Path()
+        val pts = t.puntos
+        if (pts.isEmpty()) return p
+        p.moveTo(pts[0].x * w, pts[0].y * h)
+        if (pts.size == 1) p.lineTo(pts[0].x * w + 0.5f, pts[0].y * h + 0.5f)
+        for (i in 1 until pts.size) p.lineTo(pts[i].x * w, pts[i].y * h)
+        return p
+    }
+
+    /** Sello de fecha (y firma arriba), abajo a la izquierda. */
+    fun dibujarSello(cv: Canvas, w: Float, h: Float, fecha: String, firma: String) {
+        val corto = min(w, h)
+        val size = corto * 0.034f
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            textSize = size
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            setShadowLayer(size * 0.15f, 0f, size * 0.06f, 0xCC000000.toInt())
+        }
+        val margen = corto * 0.035f
+        val lineas = if (firma.isBlank()) listOf(fecha) else listOf(firma.trim(), fecha)
+        var y = h - margen - (lineas.size - 1) * size * 1.25f
+        for (l in lineas) {
+            cv.drawText(l, margen, y, p)
+            y += size * 1.25f
+        }
+    }
+
+    fun textoSello(ms: Long): String =
+        java.text.SimpleDateFormat("dd/MM/yyyy  HH:mm", java.util.Locale.US).format(java.util.Date(ms))
+
+    /** Texto, dibujo, mosaico y sello encima de la foto ya editada. */
+    fun capas(src: Bitmap, e: Edicion): Bitmap {
+        if (e.textos.isEmpty() && e.trazos.isEmpty() && e.mosaicos.isEmpty() && !e.sello) return src
+        val out = src.copy(Bitmap.Config.ARGB_8888, true)
+        val cv = Canvas(out)
+        val w = out.width.toFloat()
+        val h = out.height.toFloat()
+        val corto = min(w, h)
+        if (e.mosaicos.isNotEmpty()) {
+            val bloque = max(8, (max(w, h) / 45f).toInt())
+            val peq = Bitmap.createScaledBitmap(src, max(1, w.toInt() / bloque), max(1, h.toInt() / bloque), false)
+            val pix = Bitmap.createScaledBitmap(peq, w.toInt(), h.toInt(), false)
+            val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                shader = BitmapShader(pix, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            e.mosaicos.forEach { t ->
+                p.strokeWidth = t.ancho * corto
+                cv.drawPath(ruta(t, w, h), p)
+            }
+        }
+        if (e.trazos.isNotEmpty()) {
+            val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            e.trazos.forEach { t ->
+                p.color = t.color
+                p.strokeWidth = t.ancho * corto
+                cv.drawPath(ruta(t, w, h), p)
+            }
+        }
+        e.textos.forEach { t ->
+            val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = t.color
+                textSize = t.tam * corto
+                textAlign = Paint.Align.CENTER
+                typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+                setShadowLayer(textSize * 0.08f, 0f, textSize * 0.04f, 0xAA000000.toInt())
+            }
+            cv.drawText(t.texto, t.x * w, t.y * h - (p.descent() + p.ascent()) / 2f, p)
+        }
+        if (e.sello) dibujarSello(cv, w, h, textoSello(e.fechaSello), e.firma)
+        return out
+    }
+
+    /** Toda la edición: geometría → recorte → ajustes → filtro → capas. */
     suspend fun aplicar(src: Bitmap, e: Edicion): Bitmap {
         val geo = withContext(Dispatchers.Default) { geometria(src, e.geo) }
         val rec = withContext(Dispatchers.Default) { recortar(geo, e.geo.recorte) }
         val aj = ajustar(rec, e.aj)
         val est = e.estilo
-        return if (est != null) Fx.apply(aj, FxUniforms.from(est, e.estiloAj)) else aj
+        val fil = if (est != null) Fx.apply(aj, FxUniforms.from(est, e.estiloAj)) else aj
+        return withContext(Dispatchers.Default) { capas(fil, e) }
     }
 }
 
@@ -257,11 +363,24 @@ private fun recorteCentrado(imgW: Int, imgH: Int, ratio: Float): Recorte {
 
 // ---------- Pantalla del editor ----------
 
-private enum class Pestana(val titulo: String) { RECORTAR("Recortar"), AJUSTES("Ajustes"), FILTROS("Filtros") }
+private enum class Pestana(val titulo: String) {
+    RECORTAR("Recortar"), AJUSTES("Ajustes"), FILTROS("Filtros"),
+    TEXTO("Texto"), DIBUJO("Dibujo"), MOSAICO("Mosaico"), SELLO("Sello")
+}
+
+private val coloresDibujo = listOf(
+    Color.White, Color.Black, Color(0xFFE53935), Color(0xFFFFD54F),
+    Color(0xFF42A5F5), Color(0xFF66BB6A), Color(0xFFE0B464)
+)
 
 @Composable
 fun EditorScreen(a: MainActivity, media: Media) {
-    var ed by remember { mutableStateOf(Edicion()) }
+    var ed by remember { mutableStateOf(Edicion(firma = a.firma.value, fechaSello = media.date)) }
+    var colorDibujo by remember { mutableStateOf(Color.White) }
+    var grosor by remember { mutableFloatStateOf(0.012f) }
+    var grosorMosaico by remember { mutableFloatStateOf(0.06f) }
+    var textoNuevo by remember { mutableStateOf("") }
+    var textoSel by remember { mutableIntStateOf(-1) }
     var pestana by remember { mutableStateOf(Pestana.RECORTAR) }
     var proporcion by remember { mutableIntStateOf(0) }
 
@@ -280,7 +399,7 @@ fun EditorScreen(a: MainActivity, media: Media) {
         }
     }
     // Resultado final (recortado, ajustado y con filtro)
-    val vista by produceState<Bitmap?>(null, geo, ed) {
+    val filtrada by produceState<Bitmap?>(null, geo, ed.geo.recorte, ed.aj, ed.estilo, ed.estiloAj) {
         val g = geo
         if (g != null) {
             delay(60)
@@ -289,6 +408,10 @@ fun EditorScreen(a: MainActivity, media: Media) {
             val est = ed.estilo
             value = if (est != null) Fx.apply(aj, FxUniforms.from(est, ed.estiloAj)) else aj
         }
+    }
+    val vista by produceState<Bitmap?>(null, filtrada, ed.textos, ed.trazos, ed.mosaicos, ed.sello, ed.firma) {
+        val f = filtrada
+        if (f != null) value = withContext(Dispatchers.Default) { Edit.capas(f, ed) }
     }
 
     Column(Modifier.fillMaxSize().background(Color.Black).windowInsetsPadding(WindowInsets.safeDrawing)) {
@@ -327,6 +450,20 @@ fun EditorScreen(a: MainActivity, media: Media) {
                 VistaRecorte(g, ed.geo.recorte, ratio) { nuevo ->
                     ed = ed.copy(geo = ed.geo.copy(recorte = nuevo))
                 }
+            } else if (pestana == Pestana.TEXTO || pestana == Pestana.DIBUJO || pestana == Pestana.MOSAICO) {
+                val img = vista ?: filtrada
+                if (img != null) {
+                    VistaCapas(
+                        img = img,
+                        modo = pestana,
+                        ed = ed,
+                        color = colorDibujo,
+                        grosor = if (pestana == Pestana.MOSAICO) grosorMosaico else grosor,
+                        textoSel = textoSel,
+                        onTextoSel = { textoSel = it },
+                        onCambio = { ed = it }
+                    )
+                }
             } else {
                 val img = vista ?: base
                 if (img != null) {
@@ -337,8 +474,8 @@ fun EditorScreen(a: MainActivity, media: Media) {
         }
 
         // Pestañas
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-            Pestana.entries.forEach { p ->
+        LazyRow(Modifier.fillMaxWidth(), contentPadding = PaddingValues(horizontal = 12.dp)) {
+            items(Pestana.entries) { p ->
                 val sel = p == pestana
                 Text(
                     p.titulo,
@@ -438,6 +575,87 @@ fun EditorScreen(a: MainActivity, media: Media) {
                             modifier = Modifier.fillMaxWidth().padding(top = 20.dp)
                         )
                     }
+                }
+
+                Pestana.TEXTO -> Column(Modifier.fillMaxSize().padding(horizontal = 20.dp).verticalScroll(rememberScrollState())) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = textoNuevo,
+                            onValueChange = { textoNuevo = it.take(60) },
+                            singleLine = true,
+                            placeholder = { Text("Escribe un texto") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                if (textoNuevo.isNotBlank()) {
+                                    ed = ed.copy(textos = ed.textos + TextoCapa(textoNuevo.trim(), 0.5f, 0.5f, 0.07f, colorDibujo.toArgb()))
+                                    textoSel = ed.textos.lastIndex
+                                    textoNuevo = ""
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Acento, contentColor = Color.Black)
+                        ) { Text("Agregar") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    SelectorColor(colorDibujo) { c ->
+                        colorDibujo = c
+                        val i = textoSel
+                        if (i in ed.textos.indices) {
+                            ed = ed.copy(textos = ed.textos.toMutableList().also { it[i] = it[i].copy(color = c.toArgb()) })
+                        }
+                    }
+                    val i = textoSel
+                    if (i in ed.textos.indices) {
+                        Deslizador("Tamaño", ed.textos[i].tam, 0.03f..0.2f, formato = { "${(it * 100).roundToInt()}" }) { v ->
+                            ed = ed.copy(textos = ed.textos.toMutableList().also { it[i] = it[i].copy(tam = v) })
+                        }
+                        Text(
+                            "Eliminar este texto", color = Color(0xFFFF6B6B), fontSize = 15.sp,
+                            modifier = Modifier.clip(RoundedCornerShape(10.dp)).clickable {
+                                ed = ed.copy(textos = ed.textos.filterIndexed { k, _ -> k != i })
+                                textoSel = -1
+                            }.padding(10.dp)
+                        )
+                    }
+                    Text("Arrastra el texto sobre la foto para moverlo.", color = Suave, fontSize = 13.sp)
+                }
+
+                Pestana.DIBUJO -> Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+                    SelectorColor(colorDibujo) { colorDibujo = it }
+                    Deslizador("Grosor", grosor, 0.003f..0.04f, formato = { "${(it * 1000).roundToInt()}" }) { grosor = it }
+                    Herramienta(Icons.AutoMirrored.Rounded.Undo, "Deshacer") {
+                        if (ed.trazos.isNotEmpty()) ed = ed.copy(trazos = ed.trazos.dropLast(1))
+                    }
+                    Text("Dibuja con el dedo sobre la foto.", color = Suave, fontSize = 13.sp)
+                }
+
+                Pestana.MOSAICO -> Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+                    Deslizador("Grosor", grosorMosaico, 0.02f..0.15f, formato = { "${(it * 100).roundToInt()}" }) { grosorMosaico = it }
+                    Herramienta(Icons.AutoMirrored.Rounded.Undo, "Deshacer") {
+                        if (ed.mosaicos.isNotEmpty()) ed = ed.copy(mosaicos = ed.mosaicos.dropLast(1))
+                    }
+                    Text("Pasa el dedo sobre caras, placas o datos para taparlos.", color = Suave, fontSize = 13.sp)
+                }
+
+                Pestana.SELLO -> Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Pildora("Sin sello", !ed.sello) { ed = ed.copy(sello = false) }
+                        Pildora("Con fecha y firma", ed.sello) { ed = ed.copy(sello = true) }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = ed.firma,
+                        onValueChange = { ed = ed.copy(firma = it.take(30)) },
+                        singleLine = true,
+                        label = { Text("Firma (opcional)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "Fecha de la foto: ${Edit.textoSello(media.date)}",
+                        color = Suave, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp)
+                    )
                 }
             }
         }
@@ -623,5 +841,144 @@ fun Deslizador(
             )
         )
         Text(formato(valor), color = Color.White, fontSize = 13.sp, textAlign = TextAlign.End, modifier = Modifier.width(44.dp))
+    }
+}
+
+// ---------- Edición de capas (texto, dibujo, mosaico) sobre la foto ----------
+
+@Composable
+private fun SelectorColor(actual: Color, onElegir: (Color) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(vertical = 6.dp)) {
+        coloresDibujo.forEach { c ->
+            Box(
+                Modifier.size(34.dp).clip(CircleShape).background(c)
+                    .border(if (c == actual) 3.dp else 1.dp, if (c == actual) Acento else Color(0x66FFFFFF), CircleShape)
+                    .clickable { onElegir(c) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun VistaCapas(
+    img: Bitmap,
+    modo: Pestana,
+    ed: Edicion,
+    color: Color,
+    grosor: Float,
+    textoSel: Int,
+    onTextoSel: (Int) -> Unit,
+    onCambio: (Edicion) -> Unit
+) {
+    val imagen = remember(img) { img.asImageBitmap() }
+    val density = LocalDensity.current
+    val tolPx = with(density) { 56.dp.toPx() }
+    var enCurso by remember { mutableStateOf<List<Offset>>(emptyList()) }
+    var arrastrando by remember { mutableIntStateOf(-1) }
+    val edActual = androidx.compose.runtime.rememberUpdatedState(ed)
+    val colorActual = androidx.compose.runtime.rememberUpdatedState(color)
+    val grosorActual = androidx.compose.runtime.rememberUpdatedState(grosor)
+
+    fun area(w: Float, h: Float): Pair<Offset, Size> {
+        val s = min(w / img.width, h / img.height)
+        val dw = img.width * s
+        val dh = img.height * s
+        return Offset((w - dw) / 2f, (h - dh) / 2f) to Size(dw, dh)
+    }
+
+    Canvas(
+        Modifier
+            .fillMaxSize()
+            .pointerInput(modo, img) {
+                if (modo == Pestana.TEXTO) {
+                    detectTapGestures { p ->
+                        val (o, s) = area(size.width.toFloat(), size.height.toFloat())
+                        val i = edActual.value.textos.indexOfLast { t ->
+                            abs(o.x + t.x * s.width - p.x) < tolPx * 2 && abs(o.y + t.y * s.height - p.y) < tolPx
+                        }
+                        onTextoSel(i)
+                    }
+                }
+            }
+            .pointerInput(modo, img) {
+                detectDragGestures(
+                    onDragStart = { p ->
+                        val (o, s) = area(size.width.toFloat(), size.height.toFloat())
+                        val n = Offset(((p.x - o.x) / s.width).coerceIn(0f, 1f), ((p.y - o.y) / s.height).coerceIn(0f, 1f))
+                        if (modo == Pestana.TEXTO) {
+                            val i = edActual.value.textos.indexOfLast { t ->
+                                abs(o.x + t.x * s.width - p.x) < tolPx * 2 && abs(o.y + t.y * s.height - p.y) < tolPx
+                            }
+                            arrastrando = i
+                            if (i >= 0) onTextoSel(i)
+                        } else {
+                            enCurso = listOf(n)
+                        }
+                    },
+                    onDragEnd = {
+                        val e = edActual.value
+                        if (modo == Pestana.DIBUJO && enCurso.isNotEmpty()) {
+                            onCambio(e.copy(trazos = e.trazos + Trazo(enCurso, colorActual.value.toArgb(), grosorActual.value)))
+                        } else if (modo == Pestana.MOSAICO && enCurso.isNotEmpty()) {
+                            onCambio(e.copy(mosaicos = e.mosaicos + Trazo(enCurso, 0, grosorActual.value)))
+                        }
+                        enCurso = emptyList()
+                        arrastrando = -1
+                    },
+                    onDragCancel = {
+                        enCurso = emptyList()
+                        arrastrando = -1
+                    },
+                    onDrag = { change, _ ->
+                        change.consume()
+                        val (o, s) = area(size.width.toFloat(), size.height.toFloat())
+                        val p = change.position
+                        val n = Offset(((p.x - o.x) / s.width).coerceIn(0f, 1f), ((p.y - o.y) / s.height).coerceIn(0f, 1f))
+                        if (modo == Pestana.TEXTO) {
+                            val i = arrastrando
+                            val e = edActual.value
+                            if (i in e.textos.indices) {
+                                onCambio(e.copy(textos = e.textos.toMutableList().also { it[i] = it[i].copy(x = n.x, y = n.y) }))
+                            }
+                        } else {
+                            enCurso = enCurso + n
+                        }
+                    }
+                )
+            }
+    ) {
+        val (o, s) = area(size.width, size.height)
+        drawImage(
+            imagen,
+            srcOffset = IntOffset.Zero,
+            srcSize = IntSize(img.width, img.height),
+            dstOffset = IntOffset(o.x.roundToInt(), o.y.roundToInt()),
+            dstSize = IntSize(s.width.roundToInt(), s.height.roundToInt())
+        )
+        // Trazo que se está dibujando (se ve al instante)
+        if (enCurso.size > 1) {
+            val corto = min(s.width, s.height)
+            val c = if (modo == Pestana.MOSAICO) Color(0x88808080) else color
+            for (i in 1 until enCurso.size) {
+                drawLine(
+                    c,
+                    Offset(o.x + enCurso[i - 1].x * s.width, o.y + enCurso[i - 1].y * s.height),
+                    Offset(o.x + enCurso[i].x * s.width, o.y + enCurso[i].y * s.height),
+                    strokeWidth = grosor * corto,
+                    cap = StrokeCap.Round
+                )
+            }
+        }
+        // Marca del texto seleccionado
+        if (modo == Pestana.TEXTO && textoSel in ed.textos.indices) {
+            val t = ed.textos[textoSel]
+            val cx = o.x + t.x * s.width
+            val cy = o.y + t.y * s.height
+            val alto = t.tam * min(s.width, s.height)
+            drawRect(
+                Acento, Offset(cx - alto * 0.4f * t.texto.length.coerceAtLeast(2), cy - alto * 0.75f),
+                Size(alto * 0.8f * t.texto.length.coerceAtLeast(2), alto * 1.5f), style = Stroke(width = 3f)
+            )
+        }
     }
 }

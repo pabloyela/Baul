@@ -27,6 +27,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -49,6 +50,9 @@ sealed class Pant {
     object Boveda : Pant()
     data class VisorBoveda(val inicio: Int) : Pant()
     data class Reproductor(val uri: Uri, val titulo: String) : Pant()
+    object Limpieza : Pant()
+    object Patron : Pant()          // entrada con patrón (sin ningún texto)
+    object CrearPatron : Pant()     // configurar patrón en Ajustes
 }
 
 class MainActivity : ComponentActivity(), PlayerHost {
@@ -64,6 +68,29 @@ class MainActivity : ComponentActivity(), PlayerHost {
     val guardando = mutableIntStateOf(0)
     val bovedaAbierta = mutableStateOf(false)
     val bovedaItems = mutableStateOf<List<VItem>>(emptyList())
+    var espacio = Boveda.REAL                         // área abierta: real o señuelo
+    private var pinSesion: String? = null             // clave usada para abrir (para respaldos)
+    val diasSinRespaldo = mutableStateOf<Int?>(null)  // aviso dentro del área privada
+    val ocultos = mutableStateOf<Set<String>>(emptySet())  // álbumes ocultos de la línea de tiempo
+    val fijados = mutableStateOf<Set<String>>(emptySet())  // álbumes fijados arriba
+    val firma = mutableStateOf("")
+    val quitarMeta = mutableStateOf(true)             // quitar ubicación al compartir
+
+    private val carpetaLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+                Boveda.ponerCarpetaRespaldo(this, uri.toString())
+                aviso("Carpeta de respaldo guardada")
+                val pin = pinSesion
+                if (pin != null) respaldoAutomatico(pin, forzar = true)
+            } catch (e: Exception) {
+                aviso("No se pudo usar esa carpeta")
+            }
+        }
+    }
 
     private var alTerminar: ((Boolean) -> Unit)? = null
     private var respaldoPin: String = ""
@@ -93,7 +120,12 @@ class MainActivity : ComponentActivity(), PlayerHost {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        columnas.intValue = getSharedPreferences("ajustes", MODE_PRIVATE).getInt("columnas", 4)
+        val pr = getSharedPreferences("ajustes", MODE_PRIVATE)
+        columnas.intValue = pr.getInt("columnas", 4)
+        ocultos.value = pr.getStringSet("ocultos", emptySet()) ?: emptySet()
+        fijados.value = pr.getStringSet("fijados", emptySet()) ?: emptySet()
+        firma.value = pr.getString("firma", "") ?: ""
+        quitarMeta.value = pr.getBoolean("quitarMeta", true)
         permiso.value = tienePermiso()
         favoritos.value = Favoritos.todos(this)
 
@@ -159,7 +191,7 @@ class MainActivity : ComponentActivity(), PlayerHost {
 
     fun atras() {
         if (pila.size > 1) pila.removeAt(pila.lastIndex) else finish()
-        if (pila.none { it is Pant.Boveda || it is Pant.VisorBoveda }) seguridad(false)
+        if (pila.none { it is Pant.Boveda || it is Pant.VisorBoveda || it is Pant.Patron }) seguridad(false)
     }
 
     // ---------- Datos ----------
@@ -183,6 +215,30 @@ class MainActivity : ComponentActivity(), PlayerHost {
         getSharedPreferences("ajustes", MODE_PRIVATE).edit().putInt("columnas", n).apply()
     }
 
+    private fun prefs() = getSharedPreferences("ajustes", MODE_PRIVATE)
+
+    fun alternarOculto(bucketId: Long) {
+        val k = bucketId.toString()
+        ocultos.value = if (k in ocultos.value) ocultos.value - k else ocultos.value + k
+        prefs().edit().putStringSet("ocultos", ocultos.value).apply()
+    }
+
+    fun alternarFijado(bucketId: Long) {
+        val k = bucketId.toString()
+        fijados.value = if (k in fijados.value) fijados.value - k else fijados.value + k
+        prefs().edit().putStringSet("fijados", fijados.value).apply()
+    }
+
+    fun guardarFirma(f: String) {
+        firma.value = f.trim()
+        prefs().edit().putString("firma", firma.value).apply()
+    }
+
+    fun alternarQuitarMeta() {
+        quitarMeta.value = !quitarMeta.value
+        prefs().edit().putBoolean("quitarMeta", quitarMeta.value).apply()
+    }
+
     fun aviso(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun pedir(pi: PendingIntent, despues: (Boolean) -> Unit) {
@@ -194,15 +250,57 @@ class MainActivity : ComponentActivity(), PlayerHost {
 
     fun compartir(lista: List<Media>) {
         if (lista.isEmpty()) return
-        val intent = if (lista.size == 1) {
+        if (!quitarMeta.value || lista.none { esJpeg(it) }) {
+            enviar(lista.map { it.uri }, lista)
+            return
+        }
+        lifecycleScope.launch {
+            val uris = withContext(Dispatchers.IO) { lista.map { m -> if (esJpeg(m)) copiaSinUbicacion(m) ?: m.uri else m.uri } }
+            enviar(uris, lista)
+        }
+    }
+
+    private fun esJpeg(m: Media) = !m.video && (m.mime == "image/jpeg" || m.mime == "image/jpg")
+
+    /** Copia temporal sin GPS ni datos del teléfono (no se recomprime la foto). */
+    private fun copiaSinUbicacion(m: Media): Uri? = try {
+        val dir = java.io.File(cacheDir, "compartir").apply { mkdirs() }
+        dir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 3_600_000 }?.forEach { it.delete() }
+        val f = java.io.File(dir, m.name.ifBlank { "foto.jpg" })
+        contentResolver.openInputStream(m.uri)?.use { inp -> f.outputStream().use { inp.copyTo(it) } }
+        val ex = androidx.exifinterface.media.ExifInterface(f)
+        listOf(
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_LATITUDE,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_LATITUDE_REF,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_LONGITUDE,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_LONGITUDE_REF,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_ALTITUDE,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_ALTITUDE_REF,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_TIMESTAMP,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_DATESTAMP,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_PROCESSING_METHOD,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_IMG_DIRECTION,
+            androidx.exifinterface.media.ExifInterface.TAG_GPS_IMG_DIRECTION_REF,
+            androidx.exifinterface.media.ExifInterface.TAG_MAKE,
+            androidx.exifinterface.media.ExifInterface.TAG_MODEL,
+            androidx.exifinterface.media.ExifInterface.TAG_BODY_SERIAL_NUMBER
+        ).forEach { ex.setAttribute(it, null) }
+        ex.saveAttributes()
+        FileProvider.getUriForFile(this, "com.tua.baul.archivos", f)
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun enviar(uris: List<Uri>, lista: List<Media>) {
+        val intent = if (uris.size == 1) {
             Intent(Intent.ACTION_SEND).apply {
                 type = lista[0].mime
-                putExtra(Intent.EXTRA_STREAM, lista[0].uri)
+                putExtra(Intent.EXTRA_STREAM, uris[0])
             }
         } else {
             Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                 type = if (lista.all { it.video }) "video/*" else if (lista.none { it.video }) "image/*" else "*/*"
-                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList<Uri>(lista.map { it.uri }))
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList<Uri>(uris))
             }
         }
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -364,6 +462,7 @@ class MainActivity : ComponentActivity(), PlayerHost {
                     aviso("No se pudo abrir la foto")
                     return@launch
                 }
+                if (e.sello && e.firma != firma.value) guardarFirma(e.firma)
                 val out = Edit.aplicar(full, e)
                 val carpeta = if (Repo.destinoValido(m.path)) m.path else "Pictures/Editadas/"
                 val base = m.name.substringBeforeLast('.').ifBlank { "foto" }
@@ -405,52 +504,142 @@ class MainActivity : ComponentActivity(), PlayerHost {
         }
     }
 
-    // ---------- Bóveda ----------
+    // ---------- Área privada ----------
 
-    /** Se llama al escribir en el buscador: si el texto es la clave, abre la bóveda. */
+    /** Se llama al escribir en el buscador: la clave real o la señuelo abren su área. */
     fun probarClave(texto: String) {
-        if (texto.length < 4 || bovedaAbierta.value || !Boveda.tieneClave(this)) return
+        if (texto.length < 4 || bovedaAbierta.value) return
+        if (!Boveda.tieneClave(this, Boveda.REAL) && !Boveda.tieneClave(this, Boveda.SENUELO)) return
         lifecycleScope.launch {
-            val ok = withContext(Dispatchers.Default) { Boveda.comprobar(this@MainActivity, texto) }
-            if (ok && !bovedaAbierta.value) {
-                bovedaAbierta.value = true
-                bovedaItems.value = withContext(Dispatchers.IO) { Boveda.items(this@MainActivity) }
-                seguridad(true)
-                ir(Pant.Boveda)
+            val esp = withContext(Dispatchers.Default) {
+                when {
+                    Boveda.comprobar(this@MainActivity, Boveda.REAL, texto) -> Boveda.REAL
+                    Boveda.comprobar(this@MainActivity, Boveda.SENUELO, texto) -> Boveda.SENUELO
+                    else -> -1
+                }
+            }
+            if (esp >= 0 && !bovedaAbierta.value) abrirBoveda(esp, texto)
+        }
+    }
+
+    /** Entrada con patrón (abre el área real). Si falla, se cierra sin decir nada. */
+    fun probarPatron(patron: List<Int>) {
+        lifecycleScope.launch {
+            val ok = withContext(Dispatchers.Default) { Boveda.comprobarPatron(this@MainActivity, patron) }
+            if (pila.lastOrNull() is Pant.Patron) pila.removeAt(pila.lastIndex)
+            if (ok) abrirBoveda(Boveda.REAL, null) else seguridad(false)
+        }
+    }
+
+    fun irPatron() {
+        if (!Boveda.tienePatron(this)) return
+        seguridad(true)
+        ir(Pant.Patron)
+    }
+
+    private suspend fun abrirBoveda(esp: Int, pin: String?) {
+        espacio = esp
+        pinSesion = pin
+        bovedaAbierta.value = true
+        bovedaItems.value = withContext(Dispatchers.IO) { Boveda.items(this@MainActivity, esp) }
+        seguridad(true)
+        ir(Pant.Boveda)
+        actualizarAvisoRespaldo()
+        if (pin != null) respaldoAutomatico(pin, forzar = false)
+    }
+
+    private fun actualizarAvisoRespaldo() {
+        val ultimo = Boveda.ultimoRespaldo(this, espacio)
+        val dias = if (ultimo == 0L) Int.MAX_VALUE else ((System.currentTimeMillis() - ultimo) / 86_400_000L).toInt()
+        diasSinRespaldo.value = if (bovedaItems.value.isNotEmpty() && dias >= 7) dias else null
+    }
+
+    /** Si hay carpeta elegida y pasaron 7 días o más, respalda solo. */
+    private fun respaldoAutomatico(pin: String, forzar: Boolean) {
+        val carpeta = Boveda.carpetaRespaldo(this) ?: return
+        if (!forzar && diasSinRespaldo.value == null) return
+        if (bovedaItems.value.isEmpty()) return
+        val esp = espacio
+        lifecycleScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                try {
+                    val arbol = Uri.parse(carpeta)
+                    val dirDoc = android.provider.DocumentsContract.buildDocumentUriUsingTree(
+                        arbol, android.provider.DocumentsContract.getTreeDocumentId(arbol)
+                    )
+                    val nombre = "privado_" + SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date()) + ".baul"
+                    val doc = android.provider.DocumentsContract.createDocument(
+                        contentResolver, dirDoc, "application/octet-stream", nombre
+                    ) ?: return@withContext false
+                    contentResolver.openOutputStream(doc)?.use { Boveda.respaldar(this@MainActivity, esp, pin, it) }
+                    true
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            if (ok) {
+                aviso("Respaldo automático guardado")
+                actualizarAvisoRespaldo()
             }
         }
     }
+
+    fun elegirCarpetaRespaldo() {
+        salidaInterna = true
+        carpetaLauncher.launch(null)
+    }
+
+    fun tieneCarpetaRespaldo() = Boveda.carpetaRespaldo(this) != null
 
     fun cerrarBoveda() {
         if (!bovedaAbierta.value) return
         bovedaAbierta.value = false
         bovedaItems.value = emptyList()
-        while (pila.size > 1 && pila.any { it is Pant.Boveda || it is Pant.VisorBoveda }) {
+        pinSesion = null
+        diasSinRespaldo.value = null
+        while (pila.size > 1 && pila.any { it is Pant.Boveda || it is Pant.VisorBoveda || it is Pant.Patron }) {
             pila.removeAt(pila.lastIndex)
         }
         seguridad(false)
     }
 
-    /** Sin capturas de pantalla ni vista en "recientes" mientras la bóveda está abierta. */
+    /** Sin capturas de pantalla ni vista en "recientes" mientras el área privada está abierta. */
     private fun seguridad(on: Boolean) {
         if (on) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
     }
 
-    fun ponerClave(pin: String) {
-        Boveda.ponerClave(this, pin)
+    // Claves (Ajustes)
+    fun tieneClave(esp: Int = Boveda.REAL) = Boveda.tieneClave(this, esp)
+    fun claveCorrecta(pin: String, esp: Int = Boveda.REAL) = Boveda.comprobar(this, esp, pin)
+    fun ponerClave(pin: String, esp: Int = Boveda.REAL) {
+        Boveda.ponerClave(this, esp, pin)
         aviso("Clave guardada")
     }
+    fun quitarClaveSenuelo() {
+        Boveda.quitarClave(this, Boveda.SENUELO)
+        aviso("Clave secundaria eliminada")
+    }
+    fun tienePatron() = Boveda.tienePatron(this)
+    fun ponerPatron(p: List<Int>) {
+        Boveda.ponerPatron(this, p)
+        aviso("Patrón guardado")
+    }
+    fun quitarPatron() {
+        Boveda.quitarPatron(this)
+        aviso("Patrón eliminado")
+    }
 
-    fun tieneClave() = Boveda.tieneClave(this)
-    fun claveCorrecta(pin: String) = Boveda.comprobar(this, pin)
+    fun miniaturaBoveda(item: VItem): Bitmap? = Boveda.miniatura(this, espacio, item)
+    fun archivoBoveda(item: VItem): java.io.File = Boveda.archivo(this, espacio, item)
 
-    /** Mueve fotos/videos a la bóveda: los copia y luego borra los originales. */
+    /** Mueve fotos/videos al área privada abierta: los copia y luego borra los originales. */
     fun ocultar(lista: List<Media>, despues: () -> Unit = {}) {
         if (!bovedaAbierta.value || lista.isEmpty()) return
+        val esp = espacio
         guardando.intValue++
         lifecycleScope.launch {
-            val hechos = withContext(Dispatchers.IO) { Boveda.meter(this@MainActivity, lista) }
+            val hechos = withContext(Dispatchers.IO) { Boveda.meter(this@MainActivity, esp, lista) }
             guardando.intValue--
             if (hechos.isEmpty()) {
                 aviso("No se pudo mover")
@@ -458,42 +647,47 @@ class MainActivity : ComponentActivity(), PlayerHost {
             }
             pedir(MediaStore.createDeleteRequest(contentResolver, hechos.map { it.first.uri })) { ok ->
                 if (ok) {
-                    aviso("${hechos.size} a la bóveda")
+                    aviso("${hechos.size} a privado")
                     despues()
                 } else {
-                    Boveda.deshacer(this@MainActivity, hechos.map { it.second })
+                    Boveda.deshacer(this@MainActivity, esp, hechos.map { it.second })
                 }
-                bovedaItems.value = Boveda.items(this@MainActivity)
+                if (bovedaAbierta.value) bovedaItems.value = Boveda.items(this@MainActivity, esp)
             }
         }
     }
 
     fun sacarDeBoveda(sel: List<VItem>) {
+        val esp = espacio
         guardando.intValue++
         lifecycleScope.launch {
-            val n = withContext(Dispatchers.IO) { Boveda.sacar(this@MainActivity, sel) }
+            val n = withContext(Dispatchers.IO) { Boveda.sacar(this@MainActivity, esp, sel) }
             guardando.intValue--
-            bovedaItems.value = Boveda.items(this@MainActivity)
+            bovedaItems.value = Boveda.items(this@MainActivity, esp)
             aviso("$n devueltos a la galería")
             recargar()
         }
     }
 
     fun eliminarDeBoveda(sel: List<VItem>) {
-        Boveda.eliminar(this, sel)
-        bovedaItems.value = Boveda.items(this)
+        Boveda.eliminar(this, espacio, sel)
+        bovedaItems.value = Boveda.items(this, espacio)
     }
 
-    /** Videos privados: se reproducen dentro de Baúl, directo desde su escondite. */
+    fun albumBoveda(sel: List<VItem>, album: String) {
+        Boveda.asignarAlbum(this, espacio, sel.map { it.file }.toSet(), album.trim())
+        bovedaItems.value = Boveda.items(this, espacio)
+    }
+
     fun abrirVideoBoveda(item: VItem) {
-        ir(Pant.Reproductor(Uri.fromFile(Boveda.archivo(this, item)), item.name))
+        ir(Pant.Reproductor(Uri.fromFile(Boveda.archivo(this, espacio, item)), item.name))
     }
 
     fun pedirRespaldo(pin: String) {
         respaldoPin = pin
         salidaInterna = true
         val fecha = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
-        exportarLauncher.launch("boveda_$fecha.baul")
+        exportarLauncher.launch("privado_$fecha.baul")
     }
 
     fun pedirImportar(pin: String) {
@@ -504,34 +698,37 @@ class MainActivity : ComponentActivity(), PlayerHost {
 
     private fun exportarBoveda(uri: Uri) {
         val pin = respaldoPin
+        val esp = espacio
         guardando.intValue++
         lifecycleScope.launch {
             val ok = withContext(Dispatchers.IO) {
                 try {
-                    contentResolver.openOutputStream(uri)?.use { Boveda.respaldar(this@MainActivity, pin, it) }
+                    contentResolver.openOutputStream(uri)?.use { Boveda.respaldar(this@MainActivity, esp, pin, it) }
                     true
                 } catch (e: Exception) {
                     false
                 }
             }
             guardando.intValue--
+            actualizarAvisoRespaldo()
             aviso(if (ok) "Respaldo guardado. Cópialo a tu computadora." else "No se pudo crear el respaldo")
         }
     }
 
     private fun importarBoveda(uri: Uri) {
         val pin = respaldoPin
+        val esp = espacio
         guardando.intValue++
         lifecycleScope.launch {
             val n = withContext(Dispatchers.IO) {
                 try {
-                    contentResolver.openInputStream(uri)?.use { Boveda.restaurar(this@MainActivity, pin, it) } ?: -3
+                    contentResolver.openInputStream(uri)?.use { Boveda.restaurar(this@MainActivity, esp, pin, it) } ?: -3
                 } catch (e: Exception) {
                     -3
                 }
             }
             guardando.intValue--
-            bovedaItems.value = Boveda.items(this@MainActivity)
+            bovedaItems.value = Boveda.items(this@MainActivity, esp)
             aviso(
                 when (n) {
                     -1 -> "La clave no corresponde a ese respaldo"
