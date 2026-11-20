@@ -12,8 +12,8 @@ android {
         applicationId = "com.tua.baul"
         minSdk = 30
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     // Llave fija: cada APK nuevo se instala encima del anterior (¡y no se pierde la bóveda!)
@@ -42,7 +42,10 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
-        freeCompilerArgs += listOf("-opt-in=androidx.compose.foundation.ExperimentalFoundationApi")
+        freeCompilerArgs += listOf(
+            "-opt-in=androidx.compose.foundation.ExperimentalFoundationApi",
+            "-opt-in=androidx.media3.common.util.UnstableApi"
+        )
     }
     buildFeatures {
         compose = true
@@ -61,4 +64,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+    implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-ui:1.5.1")
 }

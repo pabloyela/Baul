@@ -140,6 +140,7 @@ fun App(a: MainActivity) {
             is Pant.Ajustes -> AjustesScreen(a)
             is Pant.Boveda -> BovedaScreen(a)
             is Pant.VisorBoveda -> VisorBovedaScreen(a, p.inicio)
+            is Pant.Reproductor -> ReproductorScreen(a, p.uri, p.titulo)
         }
     }
 }

@@ -5,7 +5,9 @@ import android.app.PendingIntent
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.ImageDecoder
 import android.net.Uri
@@ -25,7 +27,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -44,9 +48,10 @@ sealed class Pant {
     object Ajustes : Pant()
     object Boveda : Pant()
     data class VisorBoveda(val inicio: Int) : Pant()
+    data class Reproductor(val uri: Uri, val titulo: String) : Pant()
 }
 
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), PlayerHost {
 
     // ---------- Estado ----------
     val permiso = mutableStateOf(false)
@@ -251,18 +256,57 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun abrirVideo(m: Media) = abrirVideoUri(m.uri, m.mime)
+    /** Los videos se ven dentro de Baúl (no salen a otras apps). */
+    fun abrirVideo(m: Media) = ir(Pant.Reproductor(m.uri, m.name))
 
-    private fun abrirVideoUri(uri: Uri, mime: String) {
-        try {
-            startActivity(
-                Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime.ifBlank { "video/*" })
-                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            )
-        } catch (e: Exception) {
-            aviso("No hay app para reproducir el video")
+    // ---------- Reproductor (PlayerHost) ----------
+
+    var giroManual = false
+
+    /** Entra o sale del modo reproductor: pantalla completa y giro libre. */
+    fun modoReproductor(on: Boolean) {
+        val c = WindowCompat.getInsetsController(window, window.decorView)
+        if (on) {
+            giroManual = false
+            c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            c.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            c.show(WindowInsetsCompat.Type.systemBars())
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            val attrs = window.attributes
+            attrs.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            window.attributes = attrs
         }
     }
+
+    override fun getBrightness(): Float {
+        val actual = window.attributes.screenBrightness
+        if (actual >= 0f) return actual
+        return try {
+            (Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f).coerceIn(0.05f, 1f)
+        } catch (e: Exception) {
+            0.5f
+        }
+    }
+
+    override fun setBrightness(value: Float) {
+        val attrs = window.attributes
+        attrs.screenBrightness = value.coerceIn(0.01f, 1f)
+        window.attributes = attrs
+    }
+
+    override fun rotate() {
+        giroManual = true
+        val horizontal = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        requestedOrientation = if (horizontal) ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+    }
+
+    override fun enterPip() {
+        // Sin ventana flotante dentro de Baúl (para no exponer videos privados)
+    }
+
+    override fun close() = atras()
 
     // ---------- Abrir fotos que vienen de otras apps ----------
 
@@ -440,10 +484,9 @@ class MainActivity : ComponentActivity() {
         bovedaItems.value = Boveda.items(this)
     }
 
+    /** Videos privados: se reproducen dentro de Baúl, directo desde su escondite. */
     fun abrirVideoBoveda(item: VItem) {
-        salidaInterna = true
-        val uri = FileProvider.getUriForFile(this, "com.tua.baul.archivos", Boveda.archivo(this, item))
-        abrirVideoUri(uri, item.mime)
+        ir(Pant.Reproductor(Uri.fromFile(Boveda.archivo(this, item)), item.name))
     }
 
     fun pedirRespaldo(pin: String) {
