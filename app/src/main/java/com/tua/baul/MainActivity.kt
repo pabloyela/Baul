@@ -71,6 +71,7 @@ class MainActivity : ComponentActivity(), PlayerHost {
     var espacio = Boveda.REAL                         // área abierta: real o señuelo
     private var pinSesion: String? = null             // clave usada para abrir (para respaldos)
     val diasSinRespaldo = mutableStateOf<Int?>(null)  // aviso dentro del área privada
+    val aperturas = mutableIntStateOf(0)              // cada vez que se entra al área privada
     val ocultos = mutableStateOf<Set<String>>(emptySet())  // álbumes ocultos de la línea de tiempo
     val fijados = mutableStateOf<Set<String>>(emptySet())  // álbumes fijados arriba
     val firma = mutableStateOf("")
@@ -508,7 +509,7 @@ class MainActivity : ComponentActivity(), PlayerHost {
 
     /** Se llama al escribir en el buscador: la clave real o la señuelo abren su área. */
     fun probarClave(texto: String) {
-        if (texto.length < 4 || bovedaAbierta.value) return
+        if (texto.length < 4) return
         if (!Boveda.tieneClave(this, Boveda.REAL) && !Boveda.tieneClave(this, Boveda.SENUELO)) return
         lifecycleScope.launch {
             val esp = withContext(Dispatchers.Default) {
@@ -518,7 +519,7 @@ class MainActivity : ComponentActivity(), PlayerHost {
                     else -> -1
                 }
             }
-            if (esp >= 0 && !bovedaAbierta.value) abrirBoveda(esp, texto)
+            if (esp >= 0) abrirBoveda(esp, texto)
         }
     }
 
@@ -538,6 +539,12 @@ class MainActivity : ComponentActivity(), PlayerHost {
     }
 
     private suspend fun abrirBoveda(esp: Int, pin: String?) {
+        aperturas.intValue++
+        if (bovedaAbierta.value && espacio == esp) {
+            if (pin != null) pinSesion = pin
+            if (pila.lastOrNull() !is Pant.Boveda) ir(Pant.Boveda)
+            return
+        }
         espacio = esp
         pinSesion = pin
         bovedaAbierta.value = true
@@ -590,6 +597,11 @@ class MainActivity : ComponentActivity(), PlayerHost {
     }
 
     fun tieneCarpetaRespaldo() = Boveda.carpetaRespaldo(this) != null
+
+    /** Regresar al área privada mientras la sesión sigue abierta. */
+    fun volverABoveda() {
+        if (bovedaAbierta.value && pila.lastOrNull() !is Pant.Boveda) ir(Pant.Boveda)
+    }
 
     fun cerrarBoveda() {
         if (!bovedaAbierta.value) return

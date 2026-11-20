@@ -212,8 +212,8 @@ private fun InicioScreen(a: MainActivity) {
             a.probarClave(texto)
         }
     }
-    LaunchedEffect(a.bovedaAbierta.value) {
-        if (a.bovedaAbierta.value) {
+    LaunchedEffect(a.aperturas.intValue) {
+        if (a.aperturas.intValue > 0) {
             texto = ""
             buscando = false
         }
@@ -249,6 +249,9 @@ private fun InicioScreen(a: MainActivity) {
                         detectTapGestures(onLongPress = { a.irPatron() })
                     }
                 )
+                if (a.bovedaAbierta.value) {
+                    IconoBoton(Icons.Rounded.Lock, "Volver a privado") { a.volverABoveda() }
+                }
                 IconoBoton(Icons.Rounded.CleaningServices, "Liberar espacio") { a.ir(Pant.Limpieza) }
                 IconoBoton(Icons.Rounded.Search, "Buscar") { buscando = !buscando; if (!buscando) texto = "" }
                 IconoBoton(Icons.Rounded.Settings, "Ajustes") { a.ir(Pant.Ajustes) }
@@ -1389,8 +1392,8 @@ private fun BovedaScreen(a: MainActivity) {
         Box(Modifier.weight(1f)) {
             if (items.isEmpty()) {
                 Text(
-                    "Vacío.\n\nPara guardar aquí: en la galería selecciona fotos o videos y toca «Privado». " +
-                        "Esa opción solo aparece mientras esta área está abierta.",
+                    "Vacío.\n\nPara guardar aquí: regresa con la flecha, selecciona fotos o videos en la galería " +
+                        "y toca «Privado». Luego vuelve con el candado de arriba.",
                     color = Suave, fontSize = 15.sp, textAlign = TextAlign.Center,
                     modifier = Modifier.align(Alignment.Center).padding(32.dp)
                 )
