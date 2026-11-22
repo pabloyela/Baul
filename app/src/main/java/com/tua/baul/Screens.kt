@@ -61,6 +61,7 @@ import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.DeleteForever
@@ -104,6 +105,8 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -143,11 +146,13 @@ import java.util.Locale
 
 @Composable
 fun App(a: MainActivity) {
+    val guardian = rememberSaveableStateHolder()
     Surface(color = Fondo, contentColor = Color.White, modifier = Modifier.fillMaxSize()) {
         if (!a.permiso.value) PermisoScreen(a)
         else when (val p = a.pila.last()) {
-            is Pant.Inicio -> InicioScreen(a)
-            is Pant.AlbumP -> AlbumScreen(a, p.titulo, p.filtro)
+            // Fotos y álbumes recuerdan dónde te quedaste al volver del visor
+            is Pant.Inicio -> guardian.SaveableStateProvider("inicio") { InicioScreen(a) }
+            is Pant.AlbumP -> guardian.SaveableStateProvider("album:" + p.titulo) { AlbumScreen(a, p.titulo, p.filtro) }
             is Pant.Visor -> VisorScreen(a, p.lista, p.inicio)
             is Pant.Editor -> EditorScreen(a, p.media)
             is Pant.Papelera -> PapeleraScreen(a)
@@ -196,9 +201,11 @@ private enum class Filtro(val nombre: String) { TODO("Todo"), FOTOS("Fotos"), VI
 private fun InicioScreen(a: MainActivity) {
     val todos = a.medios.value
     var sel by remember { mutableStateOf(setOf<Long>()) }
-    var filtro by remember { mutableStateOf(Filtro.TODO) }
-    var buscando by remember { mutableStateOf(false) }
-    var texto by remember { mutableStateOf("") }
+    var filtro by rememberSaveable { mutableStateOf(Filtro.TODO) }
+    var buscando by rememberSaveable { mutableStateOf(false) }
+    var texto by rememberSaveable { mutableStateOf("") }
+    var mes by rememberSaveable { mutableStateOf<java.time.YearMonth?>(null) } // filtro por mes y año
+    var elegirMes by remember { mutableStateOf(false) }
     val favs = a.favoritos.value
 
     BackHandler(enabled = sel.isNotEmpty() || buscando) {
@@ -220,9 +227,15 @@ private fun InicioScreen(a: MainActivity) {
     }
 
     val ocultos = a.ocultos.value
-    val lista = remember(todos, filtro, texto, favs, ocultos) {
+    val consulta = remember(texto) { Consulta.de(texto) }
+    val lista = remember(todos, filtro, consulta, favs, ocultos, mes) {
         (todos ?: emptyList()).filter { m ->
-            if (filtro != Filtro.FAVORITOS && texto.isBlank() && m.bucketId.toString() in ocultos) return@filter false
+            val sinBusqueda = texto.isBlank() && mes == null
+            if (filtro != Filtro.FAVORITOS && sinBusqueda && m.bucketId.toString() in ocultos) return@filter false
+            val d = diaDe(m.date)
+            val mf = mes
+            if (mf != null && (d.year != mf.year || d.monthValue != mf.monthValue)) return@filter false
+            if (!consulta.coincideFecha(d)) return@filter false
             val pasa = when (filtro) {
                 Filtro.TODO -> true
                 Filtro.FOTOS -> !m.video
@@ -230,7 +243,7 @@ private fun InicioScreen(a: MainActivity) {
                 Filtro.FAVORITOS -> m.uri.toString() in favs
                 Filtro.CAPTURAS -> Repo.esCaptura(m)
             }
-            pasa && (texto.isBlank() || m.name.contains(texto, ignoreCase = true) || m.bucket.contains(texto, ignoreCase = true))
+            pasa && consulta.coincideTexto(m)
         }
     }
     val elegidos = remember(lista, sel) { lista.filter { it.id in sel } }
@@ -253,6 +266,7 @@ private fun InicioScreen(a: MainActivity) {
                     IconoBoton(Icons.Rounded.Lock, "Volver a privado") { a.volverABoveda() }
                 }
                 IconoBoton(Icons.Rounded.CleaningServices, "Liberar espacio") { a.ir(Pant.Limpieza) }
+                IconoBoton(Icons.Rounded.CalendarMonth, "Buscar por fecha") { elegirMes = true }
                 IconoBoton(Icons.Rounded.Search, "Buscar") { buscando = !buscando; if (!buscando) texto = "" }
                 IconoBoton(Icons.Rounded.Settings, "Ajustes") { a.ir(Pant.Ajustes) }
             }
@@ -262,7 +276,7 @@ private fun InicioScreen(a: MainActivity) {
                 value = texto,
                 onValueChange = { texto = it },
                 singleLine = true,
-                placeholder = { Text("Buscar por nombre o álbum") },
+                placeholder = { Text("Nombre, álbum o fecha (ej. marzo 2024)") },
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                 colors = TextFieldDefaults.colors(
                     focusedContainerColor = Tarjeta, unfocusedContainerColor = Tarjeta,
@@ -277,7 +291,19 @@ private fun InicioScreen(a: MainActivity) {
             } else if (a.pestana.intValue == 0) {
                 MediaGrid(a, lista, sel, { sel = it }, arriba = {
                     Column {
-                    if (filtro == Filtro.TODO && texto.isBlank()) Recuerdos(a, todos)
+                    val mf = mes
+                    if (mf != null) {
+                        Row(
+                            Modifier.padding(start = 12.dp, top = 6.dp).clip(RoundedCornerShape(20.dp))
+                                .background(Acento).clickable { mes = null }
+                                .padding(start = 14.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(nombreMes(mf), color = Color.Black, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Icon(Icons.Rounded.Close, "Quitar fecha", tint = Color.Black, modifier = Modifier.padding(start = 6.dp).size(18.dp))
+                        }
+                    }
+                    if (filtro == Filtro.TODO && texto.isBlank() && mf == null) Recuerdos(a, todos)
                     LazyRow(
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -299,6 +325,14 @@ private fun InicioScreen(a: MainActivity) {
                 PestanaInferior(Icons.Rounded.Folder, "Álbumes", a.pestana.intValue == 1) { a.pestana.intValue = 1 }
             }
         }
+    }
+    if (elegirMes) {
+        SelectorMes(todos ?: emptyList(), onElegir = { ym ->
+            mes = ym
+            elegirMes = false
+            a.pestana.intValue = 0
+            sel = emptySet()
+        }, onCerrar = { elegirMes = false })
     }
 }
 
@@ -703,6 +737,57 @@ private fun MoverDialog(a: MainActivity, onElegir: (String) -> Unit, onCerrar: (
         },
         confirmButton = {},
         dismissButton = { TextButton(onClick = onCerrar) { Text("Cancelar", color = Suave) } }
+    )
+}
+
+// ======================================================================
+// Búsqueda por mes y año
+// ======================================================================
+
+fun nombreMes(ym: java.time.YearMonth): String =
+    ym.format(java.time.format.DateTimeFormatter.ofPattern("MMMM yyyy", Locale.forLanguageTag("es")))
+        .replaceFirstChar { it.uppercase() }
+
+@Composable
+private fun SelectorMes(todos: List<Media>, onElegir: (java.time.YearMonth) -> Unit, onCerrar: () -> Unit) {
+    // Cuántas fotos hay en cada mes de cada año
+    val porAnio = remember(todos) {
+        todos.groupBy { val d = diaDe(it.date); java.time.YearMonth.of(d.year, d.monthValue) }
+            .mapValues { it.value.size }
+            .entries.groupBy { it.key.year }
+            .toSortedMap(compareByDescending { it })
+    }
+    val corto = remember { java.time.format.DateTimeFormatter.ofPattern("MMM", Locale.forLanguageTag("es")) }
+    AlertDialog(
+        onDismissRequest = onCerrar,
+        title = { Text("Ir a una fecha") },
+        text = {
+            LazyColumn(Modifier.heightIn(max = 460.dp)) {
+                porAnio.forEach { (anio, meses) ->
+                    item(key = anio) {
+                        Column(Modifier.padding(vertical = 6.dp)) {
+                            Text("$anio", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Acento)
+                            Spacer(Modifier.height(6.dp))
+                            meses.sortedBy { it.key.monthValue }.chunked(4).forEach { fila ->
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(bottom = 6.dp)) {
+                                    fila.forEach { (ym, n) ->
+                                        Column(
+                                            Modifier.width(62.dp).clip(RoundedCornerShape(12.dp)).background(Tarjeta)
+                                                .clickable { onElegir(ym) }.padding(vertical = 8.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally
+                                        ) {
+                                            Text(ym.format(corto).trimEnd('.').replaceFirstChar { it.uppercase() }, fontSize = 15.sp)
+                                            Text("$n", fontSize = 12.sp, color = Suave)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onCerrar) { Text("Cerrar", color = Suave) } }
     )
 }
 

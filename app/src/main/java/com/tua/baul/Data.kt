@@ -226,3 +226,48 @@ fun esVideoMime(mime: String) = mime.startsWith("video/")
 
 @Suppress("unused")
 private fun noop(r: ContentResolver) = r
+
+// ---------- Búsqueda con fechas: "marzo 2024", "03/2024", "2024", "julio" ----------
+
+data class Consulta(val mes: Int?, val anio: Int?, val resto: String) {
+
+    fun coincideFecha(d: LocalDate): Boolean =
+        (mes == null || d.monthValue == mes) && (anio == null || d.year == anio)
+
+    fun coincideTexto(m: Media): Boolean =
+        resto.isBlank() || m.name.contains(resto, ignoreCase = true) || m.bucket.contains(resto, ignoreCase = true)
+
+    companion object {
+        private val meses = listOf(
+            "enero", "febrero", "marzo", "abril", "mayo", "junio",
+            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+        )
+
+        private fun sinTildes(t: String) = java.text.Normalizer.normalize(t, java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}+"), "")
+
+        fun de(texto: String): Consulta {
+            var mes: Int? = null
+            var anio: Int? = null
+            val resto = mutableListOf<String>()
+            val t = sinTildes(texto.lowercase(Locale.getDefault())).trim()
+            // "03/2024" o "3-2024"
+            val mmaaaa = Regex("^(\\d{1,2})[/\\-.](\\d{4})$")
+            for (palabra in t.split(Regex("\\s+")).filter { it.isNotBlank() }) {
+                val mm = mmaaaa.find(palabra)
+                when {
+                    mm != null && mm.groupValues[1].toInt() in 1..12 -> {
+                        mes = mm.groupValues[1].toInt()
+                        anio = mm.groupValues[2].toInt()
+                    }
+                    Regex("^(19|20)\\d{2}$").matches(palabra) -> anio = palabra.toInt()
+                    palabra.length >= 3 && meses.indexOfFirst { it.startsWith(palabra) } >= 0 && mes == null ->
+                        mes = meses.indexOfFirst { it.startsWith(palabra) } + 1
+                    palabra == "de" || palabra == "del" -> {}
+                    else -> resto += palabra
+                }
+            }
+            return Consulta(mes, anio, resto.joinToString(" "))
+        }
+    }
+}
