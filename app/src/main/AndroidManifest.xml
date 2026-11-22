@@ -32,6 +32,7 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="content" />
                 <data android:mimeType="image/*" />
+                <data android:mimeType="video/*" />
             </intent-filter>
         </activity>
 

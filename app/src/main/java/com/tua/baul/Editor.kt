@@ -551,7 +551,7 @@ fun EditorScreen(a: MainActivity, media: Media) {
                     }
                 }
 
-                Pestana.FILTROS -> Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+                Pestana.FILTROS -> Column(Modifier.fillMaxSize().padding(horizontal = 20.dp).verticalScroll(rememberScrollState())) {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(end = 8.dp)) {
                         item {
                             Pildora("Ninguno", ed.estilo == null) { ed = ed.copy(estilo = null) }
@@ -567,6 +567,9 @@ fun EditorScreen(a: MainActivity, media: Media) {
                         val ea = ed.estiloAj
                         Deslizador("Intensidad", ea.intensidad, 0f..1f) { ed = ed.copy(estiloAj = ea.copy(intensidad = it)) }
                         Deslizador("Rojos", ea.rojos, 0f..1f) { ed = ed.copy(estiloAj = ea.copy(rojos = it)) }
+                        Deslizador("Estructura", ea.estructura, 0f..1f) { ed = ed.copy(estiloAj = ea.copy(estructura = it)) }
+                        Deslizador("Virado", ea.virado, 0f..1f) { ed = ed.copy(estiloAj = ea.copy(virado = it)) }
+                        Deslizador("Halación", ea.halacion, 0f..1f) { ed = ed.copy(estiloAj = ea.copy(halacion = it)) }
                         Deslizador("Grano", ea.grano, 0f..1f) { ed = ed.copy(estiloAj = ea.copy(grano = it)) }
                     } else {
                         Text(

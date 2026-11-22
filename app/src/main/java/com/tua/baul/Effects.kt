@@ -6,7 +6,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sqrt
@@ -26,8 +28,11 @@ enum class Estilo(
     val vineta: Float = 0f,
     val tono: FloatArray? = null,
     val tonoCantidad: Float = 0f,
-    val color: Float = 0f,  // cuánto color original conserva (0 = B/N puro)
-    val rojos: Float = 0f   // cuánto destacan los rojos (0..1)
+    val color: Float = 0f,      // cuánto color original conserva (0 = B/N puro)
+    val rojos: Float = 0f,      // cuánto destacan los rojos (0..1)
+    val estructura: Float = 0f, // contraste local: "esculpe" texturas y músculos (0..1)
+    val virado: Float = 0f,     // sombras frías y luces cálidas (0..1)
+    val halacion: Float = 0f    // brillo rojizo alrededor de las luces fuertes (0..1)
 ) {
     CLASICO("Clásico", floatArrayOf(0.2126f, 0.7152f, 0.0722f)),
     NOIR(
@@ -38,6 +43,32 @@ enum class Estilo(
         "Dramático", floatArrayOf(0.2126f, 0.7152f, 0.0722f),
         contraste = 0.22f, curva = 0.45f, gamma = 1.1f, fade = 0.02f, grano = 0.06f, vineta = 0.6f,
         color = 0.28f
+    ),
+    GRIT(
+        "Grit", floatArrayOf(0.2126f, 0.7152f, 0.0722f),
+        contraste = 0.12f, curva = 0.35f, gamma = 1.05f, grano = 0.05f, vineta = 0.45f,
+        color = 0.45f, estructura = 0.8f
+    ),
+    CINE(
+        "Cine oscuro", floatArrayOf(0.2126f, 0.7152f, 0.0722f),
+        contraste = 0.08f, curva = 0.3f, gamma = 1.2f, fade = 0.05f, vineta = 0.5f,
+        color = 0.35f, rojos = 0.8f, estructura = 0.2f, virado = 0.8f
+    ),
+    CINE_PELICULA(
+        "Cine película", floatArrayOf(0.2126f, 0.7152f, 0.0722f),
+        contraste = 0.08f, curva = 0.3f, gamma = 1.2f, fade = 0.05f, grano = 0.2f, vineta = 0.5f,
+        color = 0.35f, rojos = 0.8f, estructura = 0.2f, virado = 0.8f, halacion = 0.6f
+    ),
+    ACERO(
+        "Acero", floatArrayOf(0.2126f, 0.7152f, 0.0722f),
+        contraste = 0.3f, curva = 0.5f, gamma = 1.05f, vineta = 0.4f,
+        tono = floatArrayOf(0.46f, 0.50f, 0.55f), tonoCantidad = 0.6f,
+        color = 0.3f, estructura = 0.45f
+    ),
+    DUOTONO(
+        "Duotono rojo", floatArrayOf(0.2126f, 0.7152f, 0.0722f),
+        contraste = 0.2f, curva = 0.4f, vineta = 0.4f,
+        tono = floatArrayOf(0.68f, 0.07f, 0.07f), tonoCantidad = 1f
     ),
     ROJO(
         "Filtro rojo", floatArrayOf(0.85f, 0.25f, -0.10f),
@@ -82,11 +113,17 @@ data class Ajustes(
     val grano: Float = 0f,      // 0..1
     val vineta: Float = 0f,     // 0..1
     val intensidad: Float = 1f, // 0 = foto original, 1 = efecto completo
-    val rojos: Float = 0f       // 0..1
+    val rojos: Float = 0f,      // 0..1
+    val estructura: Float = 0f, // 0..1
+    val virado: Float = 0f,     // 0..1
+    val halacion: Float = 0f    // 0..1
 ) {
     companion object {
         fun de(e: Estilo, base: Ajustes = Ajustes()) =
-            base.copy(grano = e.grano, vineta = e.vineta, rojos = e.rojos)
+            base.copy(
+                grano = e.grano, vineta = e.vineta, rojos = e.rojos,
+                estructura = e.estructura, virado = e.virado, halacion = e.halacion
+            )
     }
 }
 
@@ -103,6 +140,9 @@ data class FxUniforms(
     val colorKeep: Float,
     val red: Float,
     val intensity: Float,
+    val structure: Float,
+    val splitTone: Float,
+    val halation: Float,
     val grain: Float,
     val vignette: Float
 ) {
@@ -121,6 +161,9 @@ data class FxUniforms(
                 colorKeep = e.color,
                 red = a.rojos,
                 intensity = a.intensidad,
+                structure = a.estructura,
+                splitTone = a.virado,
+                halation = a.halacion,
                 grain = a.grano,
                 vignette = a.vineta
             )
@@ -199,6 +242,54 @@ object Fx {
             lr[i] = r; lg[i] = g; lb[i] = b
         }
 
+        // Luminancia desenfocada (≈2 % del ancho) para la Estructura
+        var blur: FloatArray? = null
+        var bw = 0
+        var bh = 0
+        if (u.structure > 0f) {
+            var b = src
+            while (b.width > 96) b = Bitmap.createScaledBitmap(b, b.width / 2, max(1, b.height / 2), true)
+            bw = 48
+            bh = max(1, (48f * h / w).toInt())
+            val peq = Bitmap.createScaledBitmap(b, bw, bh, true)
+            val bp = IntArray(bw * bh)
+            peq.getPixels(bp, 0, bw, 0, 0, bw, bh)
+            blur = FloatArray(bw * bh) { k ->
+                val q = bp[k]
+                (((q shr 16) and 0xFF) / 255f * u.mixR + ((q shr 8) and 0xFF) / 255f * u.mixG + (q and 0xFF) / 255f * u.mixB)
+                    .coerceIn(0f, 1f)
+            }
+        }
+        val blurArr = blur
+
+        // Halación: luces fuertes desenfocadas (≈5 % del ancho)
+        var halo: FloatArray? = null
+        var hw = 0
+        var hh = 0
+        if (u.halation > 0f) {
+            var b = src
+            while (b.width > 96) b = Bitmap.createScaledBitmap(b, b.width / 2, max(1, b.height / 2), true)
+            hw = 20
+            hh = max(1, (20f * h / w).toInt())
+            // máscara de luces fuertes en la imagen pequeña y luego promedio a 20 columnas
+            val sw = b.width
+            val sh = b.height
+            val sp = IntArray(sw * sh)
+            b.getPixels(sp, 0, sw, 0, 0, sw, sh)
+            val suma = FloatArray(hw * hh)
+            val cuenta = IntArray(hw * hh)
+            for (yy in 0 until sh) for (xx in 0 until sw) {
+                val q = sp[yy * sw + xx]
+                val l = ((q shr 16) and 0xFF) / 255f * 0.2126f + ((q shr 8) and 0xFF) / 255f * 0.7152f + (q and 0xFF) / 255f * 0.0722f
+                val m = smoothstep(0.65f, 1f, l)
+                val k = min(hh - 1, yy * hh / sh) * hw + min(hw - 1, xx * hw / sw)
+                suma[k] += m
+                cuenta[k]++
+            }
+            halo = FloatArray(hw * hh) { k -> if (cuenta[k] > 0) suma[k] / cuenta[k] else 0f }
+        }
+        val haloArr = halo
+
         val resX = GRANOS_ANCHO
         val resY = GRANOS_ANCHO * h / w
         val chunks = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
@@ -219,14 +310,30 @@ object Fx {
                             val cr = ((p shr 16) and 0xFF) / 255f
                             val cg = ((p shr 8) and 0xFF) / 255f
                             val cb = (p and 0xFF) / 255f
-                            val lum = (cr * u.mixR + cg * u.mixG + cb * u.mixB).coerceIn(0f, 1f)
+                            var lum = (cr * u.mixR + cg * u.mixG + cb * u.mixB).coerceIn(0f, 1f)
+                            if (blurArr != null) {
+                                // muestreo bilineal de la luminancia desenfocada
+                                val fx = ((xx + 0.5f) / w * bw - 0.5f).coerceIn(0f, bw - 1f)
+                                val fy = ((yy + 0.5f) / h * bh - 0.5f).coerceIn(0f, bh - 1f)
+                                val x0 = fx.toInt()
+                                val y0b = fy.toInt()
+                                val x1 = min(x0 + 1, bw - 1)
+                                val y1b = min(y0b + 1, bh - 1)
+                                val tx = fx - x0
+                                val ty = fy - y0b
+                                val top = blurArr[y0b * bw + x0] * (1 - tx) + blurArr[y0b * bw + x1] * tx
+                                val bot = blurArr[y1b * bw + x0] * (1 - tx) + blurArr[y1b * bw + x1] * tx
+                                val bl = top * (1 - ty) + bot * ty
+                                val det = lum - bl
+                                lum = (lum + u.structure * 2f * det * (1f - abs(lum - 0.5f))).coerceIn(0f, 1f)
+                            }
                             val idx = (lum * (n - 1)).toInt()
                             var r = lr[idx]
                             var g = lg[idx]
                             var b = lb[idx]
 
+                            val yF = ly[idx]
                             if (u.colorKeep > 0f || u.red > 0f) {
-                                val yF = ly[idx]
                                 val lum0 = maxOf(cr * 0.2126f + cg * 0.7152f + cb * 0.0722f, 0.001f)
                                 val k = yF / lum0
                                 val colR = (cr * k).coerceIn(0f, 1f)
@@ -254,6 +361,31 @@ object Fx {
                                     g += (vg - g) * wgt
                                     b += (vb - b) * wgt
                                 }
+                            }
+
+                            if (u.splitTone > 0f) {
+                                // sombras frías (azul verdoso) y luces cálidas
+                                val ws = (1f - yF) * (yF * 4f).coerceIn(0f, 1f) // negros profundos neutros
+                                r += u.splitTone * (ws * -0.07f + yF * 0.06f)
+                                g += u.splitTone * (ws * 0.015f + yF * 0.02f)
+                                b += u.splitTone * (ws * 0.06f + yF * -0.05f)
+                            }
+
+                            if (haloArr != null) {
+                                val fx = ((xx + 0.5f) / w * hw - 0.5f).coerceIn(0f, hw - 1f)
+                                val fy = ((yy + 0.5f) / h * hh - 0.5f).coerceIn(0f, hh - 1f)
+                                val x0 = fx.toInt()
+                                val y0h = fy.toInt()
+                                val x1 = min(x0 + 1, hw - 1)
+                                val y1h = min(y0h + 1, hh - 1)
+                                val tx = fx - x0
+                                val ty = fy - y0h
+                                val top = haloArr[y0h * hw + x0] * (1 - tx) + haloArr[y0h * hw + x1] * tx
+                                val bot = haloArr[y1h * hw + x0] * (1 - tx) + haloArr[y1h * hw + x1] * tx
+                                val hl = (top * (1 - ty) + bot * ty) * u.halation * 1.6f
+                                r += hl * 0.9f
+                                g += hl * 0.25f
+                                b += hl * 0.12f
                             }
 
                             val uu = (xx + 0.5f) / w
@@ -289,3 +421,27 @@ object Fx {
         out
     }
 }
+
+// ---------- Shaders del visor (OpenGL ES 2.0) ----------
+
+const val VERTEX_SHADER = """
+attribute vec2 aPos;
+uniform mat4 uST;
+uniform float uRot;
+uniform float uMirror;
+varying vec2 vUv;
+varying vec2 vTex;
+void main() {
+    vec2 uv = aPos * 0.5 + 0.5;
+    vUv = uv;
+    vec2 p = uv;
+    if (uMirror > 0.5) p.x = 1.0 - p.x;
+    vec2 t;
+    if (abs(uRot - 90.0) < 1.0) t = vec2(1.0 - p.y, p.x);
+    else if (abs(uRot - 180.0) < 1.0) t = vec2(1.0 - p.x, 1.0 - p.y);
+    else if (abs(uRot - 270.0) < 1.0) t = vec2(p.y, 1.0 - p.x);
+    else t = p;
+    vTex = (uST * vec4(t, 0.0, 1.0)).xy;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+"""
