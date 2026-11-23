@@ -16,6 +16,11 @@
         android:label="Baúl"
         android:largeHeap="true"
         android:theme="@style/Theme.Baul">
+        <!-- Descarga el modelo de detección del sujeto en cuanto se pueda -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="subject_segment" />
+
 
         <activity
             android:name=".MainActivity"

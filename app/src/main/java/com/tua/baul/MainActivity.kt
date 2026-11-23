@@ -464,7 +464,7 @@ class MainActivity : ComponentActivity(), PlayerHost {
                     return@launch
                 }
                 if (e.sello && e.firma != firma.value) guardarFirma(e.firma)
-                val out = Edit.aplicar(full, e)
+                val out = Edit.aplicar(full, e, this@MainActivity)
                 val carpeta = if (Repo.destinoValido(m.path)) m.path else "Pictures/Editadas/"
                 val base = m.name.substringBeforeLast('.').ifBlank { "foto" }
                 val stamp = SimpleDateFormat("HHmmss", Locale.US).format(Date())

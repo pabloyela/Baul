@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -137,7 +138,8 @@ data class Edicion(
     val mosaicos: List<Trazo> = emptyList(),
     val sello: Boolean = false,
     val firma: String = "",
-    val fechaSello: Long = 0L
+    val fechaSello: Long = 0L,
+    val desenf: Desenfoque = Desenfoque()
 )
 
 object Edit {
@@ -243,7 +245,7 @@ object Edit {
         out
     }
 
-    private fun ruta(t: Trazo, w: Float, h: Float): Path {
+    fun ruta(t: Trazo, w: Float, h: Float): Path {
         val p = Path()
         val pts = t.puntos
         if (pts.isEmpty()) return p
@@ -324,14 +326,18 @@ object Edit {
         return out
     }
 
-    /** Toda la edición: geometría → recorte → ajustes → filtro → capas. */
-    suspend fun aplicar(src: Bitmap, e: Edicion): Bitmap {
+    /** Toda la edición: geometría → recorte → ajustes → filtro → desenfoque → capas. */
+    suspend fun aplicar(src: Bitmap, e: Edicion, ctx: android.content.Context? = null): Bitmap {
         val geo = withContext(Dispatchers.Default) { geometria(src, e.geo) }
         val rec = withContext(Dispatchers.Default) { recortar(geo, e.geo.recorte) }
         val aj = ajustar(rec, e.aj)
         val est = e.estilo
         val fil = if (est != null) Fx.apply(aj, FxUniforms.from(est, e.estiloAj)) else aj
-        return withContext(Dispatchers.Default) { capas(fil, e) }
+        val des = if (e.desenf.activo) {
+            val m = if (e.desenf.auto && ctx != null) Desenfoques.mascaraSujeto(ctx, rec) else null
+            Desenfoques.aplicar(fil, e.desenf, m)
+        } else fil
+        return withContext(Dispatchers.Default) { capas(des, e) }
     }
 }
 
@@ -365,7 +371,7 @@ private fun recorteCentrado(imgW: Int, imgH: Int, ratio: Float): Recorte {
 
 private enum class Pestana(val titulo: String) {
     RECORTAR("Recortar"), AJUSTES("Ajustes"), FILTROS("Filtros"),
-    TEXTO("Texto"), DIBUJO("Dibujo"), MOSAICO("Mosaico"), SELLO("Sello")
+    TEXTO("Texto"), DIBUJO("Dibujo"), MOSAICO("Mosaico"), DESENFOQUE("Desenfoque"), SELLO("Sello")
 }
 
 private val coloresDibujo = listOf(
@@ -383,6 +389,9 @@ fun EditorScreen(a: MainActivity, media: Media) {
     var textoSel by remember { mutableIntStateOf(-1) }
     var pestana by remember { mutableStateOf(Pestana.RECORTAR) }
     var proporcion by remember { mutableIntStateOf(0) }
+    var grosorDesenf by remember { mutableFloatStateOf(0.10f) }
+    var pincelEnfoca by remember { mutableStateOf(false) }
+    var estadoMascara by remember { mutableIntStateOf(0) } // 0 nada, 1 detectando, 2 listo, 3 falló
 
     BackHandler { a.atras() }
 
@@ -409,8 +418,32 @@ fun EditorScreen(a: MainActivity, media: Media) {
             value = if (est != null) Fx.apply(aj, FxUniforms.from(est, ed.estiloAj)) else aj
         }
     }
-    val vista by produceState<Bitmap?>(null, filtrada, ed.textos, ed.trazos, ed.mosaicos, ed.sello, ed.firma) {
+    // Máscara del sujeto (fondo automático), sobre la foto ya recortada
+    val mascaraAuto by produceState<Bitmap?>(null, geo, ed.geo.recorte, ed.desenf.auto) {
+        val g = geo
+        if (!ed.desenf.auto) {
+            value = null
+            estadoMascara = 0
+        } else if (g != null) {
+            estadoMascara = 1
+            val m = Desenfoques.mascaraSujeto(a, withContext(Dispatchers.Default) { Edit.recortar(g, ed.geo.recorte) })
+            value = m
+            estadoMascara = if (m == null) 3 else 2
+        }
+    }
+    val desenfocada by produceState<Bitmap?>(null, filtrada, ed.desenf, mascaraAuto) {
         val f = filtrada
+        if (f != null) {
+            if (!ed.desenf.activo) {
+                value = f
+            } else {
+                delay(80)
+                value = Desenfoques.aplicar(f, ed.desenf, mascaraAuto)
+            }
+        }
+    }
+    val vista by produceState<Bitmap?>(null, desenfocada, ed.textos, ed.trazos, ed.mosaicos, ed.sello, ed.firma) {
+        val f = desenfocada
         if (f != null) value = withContext(Dispatchers.Default) { Edit.capas(f, ed) }
     }
 
@@ -450,7 +483,7 @@ fun EditorScreen(a: MainActivity, media: Media) {
                 VistaRecorte(g, ed.geo.recorte, ratio) { nuevo ->
                     ed = ed.copy(geo = ed.geo.copy(recorte = nuevo))
                 }
-            } else if (pestana == Pestana.TEXTO || pestana == Pestana.DIBUJO || pestana == Pestana.MOSAICO) {
+            } else if (pestana == Pestana.TEXTO || pestana == Pestana.DIBUJO || pestana == Pestana.MOSAICO || pestana == Pestana.DESENFOQUE) {
                 val img = vista ?: filtrada
                 if (img != null) {
                     VistaCapas(
@@ -458,7 +491,12 @@ fun EditorScreen(a: MainActivity, media: Media) {
                         modo = pestana,
                         ed = ed,
                         color = colorDibujo,
-                        grosor = if (pestana == Pestana.MOSAICO) grosorMosaico else grosor,
+                        grosor = when (pestana) {
+                            Pestana.MOSAICO -> grosorMosaico
+                            Pestana.DESENFOQUE -> grosorDesenf
+                            else -> grosor
+                        },
+                        enfoca = pincelEnfoca,
                         textoSel = textoSel,
                         onTextoSel = { textoSel = it },
                         onCambio = { ed = it }
@@ -640,6 +678,44 @@ fun EditorScreen(a: MainActivity, media: Media) {
                         if (ed.mosaicos.isNotEmpty()) ed = ed.copy(mosaicos = ed.mosaicos.dropLast(1))
                     }
                     Text("Pasa el dedo sobre caras, placas o datos para taparlos.", color = Suave, fontSize = 13.sp)
+                }
+
+                Pestana.DESENFOQUE -> Column(
+                    Modifier.fillMaxSize().padding(horizontal = 20.dp).verticalScroll(rememberScrollState())
+                ) {
+                    val d = ed.desenf
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Pildora("Fondo automático", d.auto) { ed = ed.copy(desenf = d.copy(auto = !d.auto)) }
+                        Pildora("Lente", d.lente) { ed = ed.copy(desenf = d.copy(lente = true)) }
+                        Pildora("Suave", !d.lente) { ed = ed.copy(desenf = d.copy(lente = false)) }
+                    }
+                    val estado = when {
+                        !d.auto -> "Pinta con el dedo lo que quieras desenfocar, o activa «Fondo automático»."
+                        estadoMascara == 1 -> "Detectando al sujeto… (la primera vez Google descarga el modelo)"
+                        estadoMascara == 3 -> "No se pudo detectar al sujeto. Puedes usar el pincel."
+                        else -> "Sujeto detectado. Corrige con «Enfocar» donde haga falta (pelo, bordes)."
+                    }
+                    Text(estado, color = Suave, fontSize = 13.sp, modifier = Modifier.padding(vertical = 6.dp))
+                    Deslizador("Fuerza", d.fuerza, 0f..1f) { ed = ed.copy(desenf = d.copy(fuerza = it)) }
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Pildora("Pincel: desenfocar", !pincelEnfoca) { pincelEnfoca = false }
+                        Pildora("Pincel: enfocar", pincelEnfoca) { pincelEnfoca = true }
+                    }
+                    Deslizador("Grosor", grosorDesenf, 0.03f..0.25f, formato = { "${(it * 100).roundToInt()}" }) { grosorDesenf = it }
+                    Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
+                        Herramienta(Icons.AutoMirrored.Rounded.Undo, "Deshacer") {
+                            if (d.pinceles.isNotEmpty()) ed = ed.copy(desenf = d.copy(pinceles = d.pinceles.dropLast(1)))
+                        }
+                        Herramienta(Icons.Rounded.RestartAlt, "Quitar todo") {
+                            ed = ed.copy(desenf = Desenfoque())
+                        }
+                    }
                 }
 
                 Pestana.SELLO -> Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
@@ -869,6 +945,7 @@ private fun VistaCapas(
     ed: Edicion,
     color: Color,
     grosor: Float,
+    enfoca: Boolean = false,
     textoSel: Int,
     onTextoSel: (Int) -> Unit,
     onCambio: (Edicion) -> Unit
@@ -881,6 +958,7 @@ private fun VistaCapas(
     val edActual = androidx.compose.runtime.rememberUpdatedState(ed)
     val colorActual = androidx.compose.runtime.rememberUpdatedState(color)
     val grosorActual = androidx.compose.runtime.rememberUpdatedState(grosor)
+    val enfocaActual = androidx.compose.runtime.rememberUpdatedState(enfoca)
 
     fun area(w: Float, h: Float): Pair<Offset, Size> {
         val s = min(w / img.width, h / img.height)
@@ -924,6 +1002,10 @@ private fun VistaCapas(
                             onCambio(e.copy(trazos = e.trazos + Trazo(enCurso, colorActual.value.toArgb(), grosorActual.value)))
                         } else if (modo == Pestana.MOSAICO && enCurso.isNotEmpty()) {
                             onCambio(e.copy(mosaicos = e.mosaicos + Trazo(enCurso, 0, grosorActual.value)))
+                        } else if (modo == Pestana.DESENFOQUE && enCurso.isNotEmpty()) {
+                            val d = e.desenf
+                            val t = Trazo(enCurso, if (enfocaActual.value) 0 else 1, grosorActual.value)
+                            onCambio(e.copy(desenf = d.copy(pinceles = d.pinceles + t)))
                         }
                         enCurso = emptyList()
                         arrastrando = -1
@@ -961,7 +1043,12 @@ private fun VistaCapas(
         // Trazo que se está dibujando (se ve al instante)
         if (enCurso.size > 1) {
             val corto = min(s.width, s.height)
-            val c = if (modo == Pestana.MOSAICO) Color(0x88808080) else color
+            val c = when {
+                modo == Pestana.MOSAICO -> Color(0x88808080)
+                modo == Pestana.DESENFOQUE && enfoca -> Color(0x8800E5FF)
+                modo == Pestana.DESENFOQUE -> Color(0x88FFFFFF)
+                else -> color
+            }
             for (i in 1 until enCurso.size) {
                 drawLine(
                     c,

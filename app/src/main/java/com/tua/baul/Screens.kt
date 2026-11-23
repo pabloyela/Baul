@@ -1314,7 +1314,7 @@ private fun AjustesScreen(a: MainActivity) {
             Spacer(Modifier.height(12.dp))
             TarjetaAjuste("Tamaño de miniaturas", "Pellizca la cuadrícula de fotos para hacerlas más grandes o pequeñas.", null) {}
             Spacer(Modifier.height(24.dp))
-            Text("Baúl 2.0 · Tecnología Universal Avanzada", color = Suave, fontSize = 13.sp)
+            Text("Baúl 2.5 · Tecnología Universal Avanzada", color = Suave, fontSize = 13.sp)
         }
     }
     if (dialogoClave) ClaveDialog(a, 0) { dialogoClave = false; refrescar++ }

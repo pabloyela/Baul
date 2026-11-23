@@ -12,8 +12,8 @@ android {
         applicationId = "com.tua.baul"
         minSdk = 30
         targetSdk = 35
-        versionCode = 7
-        versionName = "2.4"
+        versionCode = 8
+        versionName = "2.5"
     }
 
     // Llave fija: cada APK nuevo se instala encima del anterior (¡y no se pierde la bóveda!)
@@ -66,4 +66,7 @@ dependencies {
     implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("androidx.media3:media3-exoplayer:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
+    // Detección del sujeto para «Fondo automático» (el modelo lo descarga Google Play, ~200 KB en la app)
+    implementation("com.google.android.gms:play-services-mlkit-subject-segmentation:16.0.0-beta1")
+    implementation("com.google.android.gms:play-services-base:18.5.0")
 }
